@@ -105,6 +105,11 @@ class IapLinkRestartTest {
                 carOut.write(IapWire.packet(IapWire.Frame(0x40,11,0,10,IapWire.csm(0x5703))));carOut.flush()
             }
             link.start()
+            // Let the reader thread settle into its read loop before flagging a
+            // restart; start() returns as soon as the initial handshake completes,
+            // but the reader may still be between iterations, and a restart issued
+            // too early can be consumed before the loop logs it.
+            Thread.sleep(200)
             link.restart()
             assertTrue("a requested restart must re-run the exchange",logs.any{it.contains("restart requested")})
             assertTrue(link.await(0x5703,10).isEmpty())
