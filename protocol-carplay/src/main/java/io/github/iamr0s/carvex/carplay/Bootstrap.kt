@@ -439,6 +439,11 @@ object Bootstrap {
             messages.forEach{(id,fields)->if(id in received)send(id,fields)else log("Skip unadvertised "+id.toString(16))}
             if(identity.id.isNotEmpty())send(0x4e0c,listOf(0 to IapWire.cstring(identity.id)))
             else log("Skip 4e0c: empty device UUID")
+            // 24A446 advertises what it can receive; if the head unit promised
+            // 0x5702/0x4300 in Identify, send them regardless of the locally
+            // parsed route flags, which are derived from a narrower byte range.
+            if(received.contains(0x5702))send(0x5702)
+            if(received.contains(0x4300))send(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
             if(runtimeSession)return
             // 24A446 creates a declaration pair only when both directions are
             // present: phone->accessory request and accessory->phone response.
