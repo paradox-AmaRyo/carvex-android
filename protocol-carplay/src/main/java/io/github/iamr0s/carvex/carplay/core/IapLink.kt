@@ -951,6 +951,64 @@ class IapLink(input:InputStream, private val output:OutputStream,
             true
         } catch(_:RejectedExecutionException) { false }
     }
+
+    /**
+     * MyLink 20013: 立刻写一帧控制消息，不等它的 ACK，也不走有序 worker。
+     *
+     * 死锁背景：认证后主循环用 [sendAsync] 把 4e0e 等帧投给单线程 `asyncSender`，
+     * 其 worker 进入 @Synchronized 的 [sendCsm] 后在 `ackLock.wait()` 里等 ACK；
+     * 此时它一直占着 `this` 监视器和唯一的 worker。车机发 AE00 后要等 AE01 才
+     * ACK 4e0e，于是主循环即便 poll 到 AE00，若再用 [sendAsync] 回 AE01 也只会
+     * 排在卡死的 worker 后面，直到 4e0e 超时拆链都发不出去。
+     *
+     * 这里复用 [sendCsm] 相同的锁顺序（writeLock 快照 -> ackLock 分配 PSN 并登记
+     * txSlot -> writeLock 写帧），但**不加 @Synchronized**、不进 ACK 等待循环，
+     * 因此不与被卡死的 worker 争 `this` 监视器。登记 txSlot 让后续累积 ACK /
+     * 重传记账保持一致：车机对 AE01 的累积 ACK 会一并释放 4e0e 的 slot，
+     * [sendCsm] 随即被 [acceptCumulativeAck] 唤醒并正常退出。
+     */
+    fun postNow(id:Int, fields:List<Pair<Int,ByteArray>> = emptyList(),
+                expectedGeneration:Int?=null):Boolean {
+        if(closed.get()||error!=null)return false
+        val snapshot=synchronized(writeLock){
+            check(expectedGeneration==null||expectedGeneration==generation){
+                "iAP control generation changed before postNow"}
+            val session=checkNotNull(negotiatedControlSession){
+                "iAP link has no confirmed control session"}
+            Pair(session,synchronizationEpoch)
+        }
+        val (session,epoch)=snapshot
+        val data=IapWire.csm(id,fields)
+        val chunks=buildList{
+            var p=0
+            while(p<data.size){
+                val end=minOf(data.size,p+maxPayloadBytes())
+                add(data.copyOfRange(p,end));p=end
+            }
+        }
+        val pendingWrites=mutableListOf<IapWire.Frame>()
+        synchronized(ackLock){
+            check(synchronizationEpoch==epoch&&negotiatedControlSession==session){
+                "iAP link synchronization changed during postNow"}
+            if(receivedAck<0)receivedAck=sendSeq
+            for(chunk in chunks){
+                sendSeq=(sendSeq+1) and 255
+                txSlots[sendSeq]=TxSlot(sendSeq,chunk,
+                    attempts=1,sentAtNanos=System.nanoTime())
+                pendingWrites+=IapWire.Frame(0x40,sendSeq,receiveSeq,session.id,chunk)
+            }
+            pendingSeq=txSlots.keys.firstOrNull()?:-1
+        }
+        pendingWrites.forEach{frame->
+            synchronized(writeLock){
+                check(synchronizationEpoch==epoch&&negotiatedControlSession==session){
+                    "iAP link synchronization changed during postNow"}
+                write(frame)
+            }
+        }
+        log("iAP TX "+id.toString(16)+" (postNow)")
+        return true
+    }
     @Synchronized private fun sendCsm(data:ByteArray,expectedGeneration:Int?=null) {
         val snapshot=synchronized(writeLock){
             check(expectedGeneration==null||expectedGeneration==generation){"iAP control generation changed before send"}

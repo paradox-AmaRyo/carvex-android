@@ -425,6 +425,18 @@ object Bootstrap {
             if(optionalSent||!transactions.ready)return
             optionalSent=true
             handoffDeadline=System.nanoTime()+handoffWaitMs*1_000_000L
+            // MyLink 20013: 认证后的这些帧都是通知类可选项，必须用「入队即返回」的
+            // 固件语义。同步 send() 会阻塞等链路 ACK；车机在 AE00 之后正等 AE01，
+            // 不会 ACK 4e0e，主循环卡在这里就 poll 不到已经到达的 AE00，AE01 一次
+            // 都发不出去，最终车机超时拆 RFCOMM。改用 IapLink.sendAsync 让主循环
+            // 立即回到 link.poll() 处理 AE00。
+            fun queue(id:Int,fields:List<Pair<Int,ByteArray>> = emptyList()){
+                checkGeneration()
+                log(ProtocolTrace.event("IAP2","RFCOMM","tx","0x"+id.toString(16),"queued","fields"+fields.size))
+                link.sendAsync(id,fields,expectedGeneration=generation){t->
+                    if(t!=null)log("async tx 0x"+id.toString(16)+" failed: "+t.javaClass.simpleName+" "+(t.message?:""))
+                }
+            }
             // 4e0e 参数 0 是蓝牙 MAC，参数 1 是设备唯一标识（C-0024 的 copyUniqueDeviceID 一解，
             // 与 4e0c 同源）。标识为空时只发参数 0，并在日志里说明少发了哪一个。
             val transportFields=buildList{
@@ -436,14 +448,14 @@ object Bootstrap {
                 0x4e0a to listOf(0 to IapWire.cstring("zh")),
                 0x4e0e to transportFields,
                 0x4e0d to listOf(0 to byteArrayOf(1)))
-            messages.forEach{(id,fields)->if(id in received)send(id,fields)else log("Skip unadvertised "+id.toString(16))}
-            if(identity.id.isNotEmpty())send(0x4e0c,listOf(0 to IapWire.cstring(identity.id)))
+            messages.forEach{(id,fields)->if(id in received)queue(id,fields)else log("Skip unadvertised "+id.toString(16))}
+            if(identity.id.isNotEmpty())queue(0x4e0c,listOf(0 to IapWire.cstring(identity.id)))
             else log("Skip 4e0c: empty device UUID")
             // 24A446 advertises what it can receive; if the head unit promised
             // 0x5702/0x4300 in Identify, send them regardless of the locally
             // parsed route flags, which are derived from a narrower byte range.
-            if(received.contains(0x5702))send(0x5702)
-            if(received.contains(0x4300))send(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
+            if(received.contains(0x5702))queue(0x5702)
+            if(received.contains(0x4300))queue(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
             if(runtimeSession)return
             // 24A446 creates a declaration pair only when both directions are
             // present: phone->accessory request and accessory->phone response.
@@ -451,10 +463,10 @@ object Bootstrap {
             // waiting for a message the peer never promised to send.
             val routes=requireNotNull(identified).capabilities.networkHandoff
             if(routes.wifiAnnouncement){
-                send(0x5702);announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
+                queue(0x5702);announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
             }
             if(routes.carPlayStartSession){
-                send(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
+                queue(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
             }
             if(!routes.hasSupportedRoute)log("Identification accepted; no locally supported network handoff route declared")
         }
@@ -678,8 +690,14 @@ object Bootstrap {
                     // 而此前 4e0e 恰好卡在这个时间窗内。应答载荷格式研究文档仍标 OPEN，
                     // 这里先回一个空参数应答，把链路保活，观察车机后续行为。
                     0xae00->{
-                        send(0xae01)
-                        log("AE01 sent in reply to AE00 (StartExternalAccessorySession); payload format still OPEN")
+                        // 必须走 postNow：此刻 asyncSender 的唯一 worker 多半还卡在 4e0e
+                        // 的 ACK 等待里（车机在等 AE01 才 ACK），sendAsync 会排队到拆链
+                        // 都发不出去。postNow 直接写一帧并立刻返回，不等 ACK。
+                        checkGeneration()
+                        log(ProtocolTrace.event("IAP2","RFCOMM","tx","0xae01","queued","fields0"))
+                        val posted=link.postNow(0xae01,expectedGeneration=generation)
+                        log(if(posted)"AE01 posted in reply to AE00 (StartExternalAccessorySession); payload format still OPEN"
+                            else "AE01 postNow failed (link closed or generation changed)")
                     }
                     0xaa04->throw SecurityException("Accessory authentication rejected")
                     // A peer 1D03 remains a local terminal policy; it is not the
