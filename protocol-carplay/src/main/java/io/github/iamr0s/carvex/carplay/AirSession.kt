@@ -488,24 +488,29 @@ class AirSession(private val context:Context,private val path:NetworkPath,privat
                 // 固件对 /info 与 Bonjour 的 deviceID 冲突是"保留原值并继续"，这里保持一致，只记录。
                 if(PairingIdentityBinding.lastDeviceIdConflict)
                     log("receiver deviceID conflicts with Bonjour identity; keeping the advertised identity")
-                if(options.experiment&&identifier==null&&inputs.startReady&&metadata.pairingId.isNullOrBlank()){
+                if(options.experiment&&identifier==null&&
+                    (inputs.startReady&&metadata.pairingId.isNullOrBlank() ||
+                     ExperimentalHapDiscovery.identityLearnedDuringSetup(metadata))){
                     // 4301 can provide a complete endpoint while Bonjour is unavailable. In this
                     // experimental-only path, Pair Setup learns the real HAP identifier first;
                     // the receiver is only a storage alias and is never compared to that HAP id.
+                    // CarPlay _airplay._tcp records without pi/pk take the same route: Bonjour
+                    // there advertises the endpoint only, so the peer identity is whatever Pair
+                    // Setup returns and is stored under the receiver alias.
                     val receiverAlias=bootstrap.startSession?.receiver?:bootstrap.receiver
                     val homeKit=HomeKit(c,identity,ExperimentalHapV11::srp)
                     val previous=store.experimental.loadFallback(identity,receiverAlias)
                     if(previous!=null){
-                        log("Experimental HAP 4301-only fallback: stored peer found; using Pair Verify")
+                        log("Experimental HAP fallback: stored peer found for alias "+receiverAlias+"; using Pair Verify")
                         shared=homeKit.verify(previous)
                     }else{
-                        log("Experimental HAP 4301-only fallback: Bonjour pairing id missing; using Pair Setup")
+                        log("Experimental HAP fallback: no bound pairing identifier; using Pair Setup whose reply owns the peer identity")
                         val paired=homeKit.setup(metadata.publicKey,"3939".toByteArray(Charsets.US_ASCII))
                         val verified=homeKit.verify(paired)
                         store.experimental.saveFallback(identity,receiverAlias,paired)
                         shared=verified
                     }
-                    log("Experimental HAP 4301-only fallback verified; receiver is a storage alias, not the HAP identifier")
+                    log("Experimental HAP fallback verified; receiver is a storage alias, not the HAP identifier")
                 }else if(options.experiment){
                     val pairingId=requireNotNull(metadata.pairingId)
                     val boundIdentifier=requireNotNull(identifier)

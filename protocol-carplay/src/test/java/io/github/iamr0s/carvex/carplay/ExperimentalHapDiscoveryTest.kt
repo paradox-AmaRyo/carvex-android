@@ -43,11 +43,13 @@ class ExperimentalHapDiscoveryTest {
             SecurityRouter.route(missing)
         }.diagnostic.localReason)
     }
-    @Test fun incompleteOrUnboundDiscoveryNeverSelectsTheCompatibilityGate(){
-        for(meta in listOf(metadata.copy(pairingId=null),metadata.copy(pairingId=" "),
-            metadata.copy(pairingId="x".repeat(1025)),metadata.copy(publicKey=null),metadata.copy(publicKey=ByteArray(31)),
+    @Test fun malformedOrMisboundDiscoveryNeverSelectsTheCompatibilityGate(){
+        // Malformed identity hints and mismatched endpoints stay rejected.
+        for(meta in listOf(metadata.copy(pairingId=" "),
+            metadata.copy(pairingId="x".repeat(1025)),metadata.copy(publicKey=ByteArray(31)),
+            metadata.copy(pairingId=null,publicKey=ByteArray(32){7}),
             metadata.copy(endpoint=null),metadata.copy(endpoint=InetAddress.getByName("192.0.2.2")),
-            metadata.copy(port=7001),metadata.copy(deviceId=null),
+            metadata.copy(port=7001),
             metadata.copy(deviceId="02:66:77:88:99:AA"))){
             val input=bootstrap().securityInputs(binding,meta,true,true,experimentalIntegrityOnly=true)
             assertNull(input.pairedCapabilityGate)
@@ -61,6 +63,22 @@ class ExperimentalHapDiscoveryTest {
         }
         assertNull(bootstrap().securityInputs(binding,metadata,false,true,experimentalIntegrityOnly=true).pairedCapabilityGate)
         assertNull(bootstrap().securityInputs(binding,metadata,true,false,experimentalIntegrityOnly=true).pairedCapabilityGate)
+    }
+    @Test fun discoveryWithoutPairingIdentifierOrKeyIsACandidateAndLearnsIdentityDuringSetup(){
+        // CarPlay _airplay._tcp on a VW/MIB head unit carries neither pi nor pk. Bonjour still
+        // proves the endpoint, so the gate must let it through and Pair Setup binds the identity.
+        val noHints=metadata.copy(pairingId=null,publicKey=null)
+        val input=bootstrap().securityInputs(binding,noHints,true,true,experimentalIntegrityOnly=true)
+        assertEquals(true,input.pairedCapabilityGate)
+        assertEquals(SecurityRoute.PAIRED,SecurityRouter.route(input))
+        assertTrue(ExperimentalHapDiscovery.identityLearnedDuringSetup(noHints))
+        // A missing deviceid does not by itself disqualify an otherwise bound endpoint.
+        val noDeviceId=metadata.copy(deviceId=null)
+        assertEquals(true,bootstrap().securityInputs(binding,noDeviceId,true,true,experimentalIntegrityOnly=true).pairedCapabilityGate)
+        // The fully bound shape keeps working and does not need the learn-during-setup route.
+        val complete=bootstrap().securityInputs(binding,metadata,true,true,experimentalIntegrityOnly=true)
+        assertEquals(true,complete.pairedCapabilityGate)
+        assertFalse(ExperimentalHapDiscovery.identityLearnedDuringSetup(metadata))
     }
     @Test fun staleSourceCannotUseTheExperimentalProfileEvenWithMatchingMetadata(){
         for(stale in listOf(binding.copy(generation=3),binding.copy(epoch=8))){

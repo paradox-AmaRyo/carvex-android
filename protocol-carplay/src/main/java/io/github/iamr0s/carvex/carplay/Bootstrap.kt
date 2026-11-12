@@ -410,7 +410,10 @@ object Bootstrap {
          *  [0xaa06] 是例外：不查认证，但仍要求识别完成且在对端声明的入站集合里。
          *  固件里 0x1D03/0xAA04 没有入站处理器；本实现把它们当终止通知，放行以保留快速失败。 */
         val unconditionalInbound=setOf(0x0000,0x0004,0x0005,0x1d01,0x1d03,0x1d05,0x1d06,
-            0xaa01,0xaa03,0xaa04)
+            0xaa01,0xaa03,0xaa04,
+            // AE00 是车机在识别完成后主动发起的 Power 组请求，不会出现在 accessorySends 里。
+            // 放行它，否则被 inboundAllowed 挡掉后永远回不了 AE01。
+            0xae00)
         fun inboundAllowed(id:Int):Boolean{
             if(id in unconditionalInbound)return true
             val state=transactions.context(LinkTransport.BT_RFCOMM,ConnectionDirection.OUTBOUND)
@@ -663,6 +666,15 @@ object Bootstrap {
                     0xaa06->{
                         val request=requireNotNull(certificateTransaction).onSerial(fields,generation,linkEpoch)
                         send(0xaa00,request)
+                    }
+                    // Power 组 AE00：车机请求启动外接配件会话（StartExternalAccessorySession）。
+                    // 24A446 规则表把 AE00/AE01 列为 required 对，只有 AE00 没有 AE01 时车机会
+                    // 认为会话没建立。实测 MyLink 在发出 AE00 后约 1.2s 主动拆掉 RFCOMM，
+                    // 而此前 4e0e 恰好卡在这个时间窗内。应答载荷格式研究文档仍标 OPEN，
+                    // 这里先回一个空参数应答，把链路保活，观察车机后续行为。
+                    0xae00->{
+                        send(0xae01)
+                        log("AE01 sent in reply to AE00 (StartExternalAccessorySession); payload format still OPEN")
                     }
                     0xaa04->throw SecurityException("Accessory authentication rejected")
                     // A peer 1D03 remains a local terminal policy; it is not the
