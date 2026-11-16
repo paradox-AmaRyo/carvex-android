@@ -584,6 +584,24 @@ class BootstrapNegotiationTest {
         peer.command(0xaa03,listOf(0 to accessory.sign(requireNotNull(challenge.second[0]))))
         assertEquals(0xaa05,peer.next().first)
     }
+    @Test(timeout=15000) fun mylinkDeclarationProbeSendsWifiRequestBeforeOptionalIdentity() {
+        Peer(2).use { peer ->
+            peer.initialize()
+            val work=peer.negotiate()
+            authenticateV2(peer,SyntheticAccessory(),byteArrayOf(0x57,3,0xaa.toByte(),6),
+                byteArrayOf(0x4e,0x0d,0x4e,0x0e,0x57,2))
+            // Read wire order, not nextOf: the latter would conceal the regression.
+            assertEquals(0x5702,peer.nextRaw().first)
+            assertEquals(0x4e0e,peer.nextRaw().first)
+            assertEquals(0x4e0d,peer.nextRaw().first)
+            assertEquals(0x4e0c,peer.nextRaw().first)
+            peer.command(0x5703,listOf(1 to IapWire.cstring("synthetic"),2 to IapWire.cstring("password1"),
+                4 to byteArrayOf(6),3 to byteArrayOf(2)))
+            assertEquals("synthetic",work.get(3,TimeUnit.SECONDS).ssid)
+            assertNoApplicationOutput(peer)
+        }
+    }
+
     @Test(timeout=15000) fun wifiAnnouncementOnlyRequestsDiscoveryWithoutInventingAnEndpoint() {
         Peer(2).use { peer ->
             val accessory=SyntheticAccessory();peer.initialize()

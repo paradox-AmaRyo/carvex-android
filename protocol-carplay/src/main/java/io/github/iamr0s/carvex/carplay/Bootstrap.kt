@@ -450,6 +450,16 @@ object Bootstrap {
                 }
                 if(!queued)log("async tx 0x"+id.toString(16)+" not queued (link closed or silent guard, 20015)")
             }
+            // Controlled compatibility experiment for the observed MyLink declaration
+            // shape, not a manufacturer identification. Do not let optional 4e0e
+            // block the supported Wi-Fi request in the single-worker TX queue.
+            val wifiFirstProbe=experimentalIntegrityOnly&&!runtimeSession&&
+                received==setOf(0x4e0d,0x4e0e,0x5702)&&accessorySends==setOf(0x5703,0xaa06)
+            if(wifiFirstProbe){
+                log("Compatibility probe: 5702 before optional identity notifications; AE01 payload remains unverified")
+                queue(0x5702)
+                announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000L
+            }
             // 4e0e 参数 0 是蓝牙 MAC，参数 1 是设备唯一标识（C-0024 的 copyUniqueDeviceID 一解，
             // 与 4e0c 同源）。标识为空时只发参数 0，并在日志里说明少发了哪一个。
             val transportFields=buildList{
@@ -473,7 +483,7 @@ object Bootstrap {
             val startSessionFields=listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac))))
             val wifiAnnouncementRequested=received.contains(0x5702)
             val carPlayStartRequested=received.contains(0x4300)
-            if(wifiAnnouncementRequested){
+            if(wifiAnnouncementRequested&&!wifiFirstProbe){
                 queue(0x5702);announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
             }
             if(carPlayStartRequested)queue(0x4300,startSessionFields)
