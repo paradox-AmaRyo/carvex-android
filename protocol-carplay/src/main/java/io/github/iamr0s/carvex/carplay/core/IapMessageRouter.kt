@@ -20,10 +20,10 @@ object IapMessageRouter {
         0x5702,0x5703,
         0x5000,0x5001,0x5002,
         0xaa00,0xaa01,0xaa02,0xaa03,0xaa04,0xaa05,0xaa06,
-        // Power 族（AE）。2020 雪佛兰 MyLink 在识别完成后会发 AE00 会话起点。
-        // 20015 更正：研究档 12-message-table.md 的 Power 表无 AE01 handler，24A446
-        // 固件也无 AE01 消费者；本机绝不伪造 AE01。保留 0xae01 仅用于对端万一发来时
-        // 仍能归类（诊断用），0xae00 由 Bootstrap 放行后只记录字段、不回应答。
+        // Power family. The identification rule table declares AE01 in the
+        // phone-to-accessory direction; absence from the phone's inbound handler
+        // table does not make it undefined. Its payload is not yet established:
+        // keep diagnostic routing, but do not invent an empty AE01 response.
         0xae00,0xae01
     )+IapWirelessPairing.Message.ids
 

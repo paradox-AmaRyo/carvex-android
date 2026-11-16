@@ -421,7 +421,7 @@ object Bootstrap {
         val unconditionalInbound=setOf(0x0000,0x0004,0x0005,0x1d01,0x1d03,0x1d05,0x1d06,
             0xaa01,0xaa03,0xaa04,
             // AE00 是车机在识别完成后主动发起的 Power 组会话起点，不会出现在 accessorySends 里。
-            // 20015：放行仅为记录其字段用于诊断；不回任何应答（AE01 不是协议定义的消息）。
+            // Record fields for diagnosis; AE01 exists, but its response payload is unverified.
             0xae00)
         fun inboundAllowed(id:Int):Boolean{
             if(id in unconditionalInbound)return true
@@ -437,7 +437,7 @@ object Bootstrap {
             // MyLink 20013: 认证后的这些帧都是通知类可选项，必须用「入队即返回」的
             // 固件语义。同步 send() 会阻塞等链路 ACK，主循环卡在这里就 poll 不到
             // 已经到达的入站消息。改用 IapLink.sendAsync 让主循环立即回到 link.poll()。
-            // 20015: 不再假设「车机等 AE01 才 ACK 4e0e」——AE01 是未定义消息，已删除。
+            // Do not assume AE01 gates the ACK for 4e0e; that dependency is unproven.
             fun queue(id:Int,fields:List<Pair<Int,ByteArray>> = emptyList()){
                 checkGeneration()
                 log(ProtocolTrace.event("IAP2","RFCOMM","tx","0x"+id.toString(16),"queued","fields"+fields.size))
@@ -502,6 +502,10 @@ object Bootstrap {
                 // 重建 90 秒）。在原预算之上追加 25s，期间主循环照常 poll，等它自己松口。
                 // 注意：不能写成 max(handoffDeadline, silentSince+25s)——sendOptional 起算的
                 // 30s 本来就比 silentSince+25s 更晚，那样等于没有延展。
+                // Initialize the handoff budget before taking its snapshot. On the
+                // first ready iteration sendOptional changes handoffDeadline from 0.
+                // Reading it first makes the timeout below expire immediately.
+                if(transactions.ready)sendOptional()
                 val silentSince=peerSilentSince.get()
                 val effectiveHandoffDeadline=if(silentSince!=0L)
                     handoffDeadline+PEER_SILENT_BUDGET_MS*1_000_000L
@@ -513,7 +517,6 @@ object Bootstrap {
                 }
                 // Link ACK, early Wi-Fi config or remote AA/05 do not prove local authentication.
                 if(transactions.ready){
-                    sendOptional()
                     if(runtimeSession){
                         handedOff=true
                         return ControlResult(null,requireNotNull(identified))
@@ -717,12 +720,9 @@ object Bootstrap {
                         val request=requireNotNull(certificateTransaction).onSerial(fields,generation,linkEpoch)
                         send(0xaa00,request)
                     }
-                    // Power 组 AE00：车机在识别完成后主动发起的会话起点，仅记录、不回应。
-                    // 20015 更正：研究档 12-message-table.md:144-154 的 Power 表只有
-                    // AE00/AE02/AE03/AE05/AE06，AE01 不是协议定义消息；20014 回空参数 AE01 后
-                    // 车机连链路层 ACK 都停了，随后 4e0e/AE01 重传并复位 CarPlay 插件。
-                    // 固件 24A446 也没有 AE01 handler。这里把字段打进 diagnostics，
-                    // 供三次实车对照；绝不伪造未定义应答。
+                    // AE01 exists in the phone-to-accessory Power rule table.
+                    // Its payload and the response required here remain unverified.
+                    // Record AE00 without inventing an empty AE01 response.
                     0xae00->{
                         val dump=fields.ordered.joinToString(prefix="[",postfix="]"){(id,value)->
                             val hex=value.joinToString(""){java.lang.String.format(java.util.Locale.ROOT,"%02X",it.toInt() and 255)}
@@ -730,7 +730,7 @@ object Bootstrap {
                             java.lang.String.format(java.util.Locale.ROOT,"0x%04X",id)+"="+hex+
                                 (if(text.isEmpty())"" else "(\""+text+"\")")
                         }
-                        log("AE00 received, fields="+dump+"; no AE01 reply (undefined message, 20015)")
+                        log("AE00 received, fields="+dump+"; AE01 response withheld: payload unverified")
                     }
                     0xaa04->throw SecurityException("Accessory authentication rejected")
                     // A peer 1D03 remains a local terminal policy; it is not the
