@@ -588,8 +588,18 @@ class BootstrapNegotiationTest {
         Peer(2).use { peer ->
             peer.initialize()
             val work=peer.negotiate()
-            authenticateV2(peer,SyntheticAccessory(),byteArrayOf(0x57,3,0xaa.toByte(),6),
-                byteArrayOf(0x4e,0x0d,0x4e,0x0e,0x57,2))
+            val accessory=SyntheticAccessory()
+            assertEquals(0x1d00,peer.next().first)
+            peer.command(0x1d01,identification(byteArrayOf(0x57,3,0xaa.toByte(),6),
+                byteArrayOf(0x4e,0x0d,0x4e,0x0e,0x57,2)))
+            assertEquals(0x1d02,peer.next().first)
+            assertEquals(0xaa00,peer.next().first)
+            peer.command(0xaa06,listOf(0 to ByteArray(16){(it+0x60).toByte()}))
+            assertEquals(0xaa00,peer.next().first)
+            peer.command(0xaa01,listOf(0 to accessory.certificate))
+            val challenge=peer.next();assertEquals(0xaa02,challenge.first)
+            peer.command(0xaa03,listOf(0 to accessory.sign(requireNotNull(challenge.second[0]))))
+            assertEquals(0xaa05,peer.next().first)
             // Read wire order, not nextOf: the latter would conceal the regression.
             assertEquals(0x5702,peer.nextRaw().first)
             assertEquals(0x4e0e,peer.nextRaw().first)
