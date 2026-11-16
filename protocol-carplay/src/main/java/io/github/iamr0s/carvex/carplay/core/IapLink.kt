@@ -132,6 +132,11 @@ class IapLink(input:InputStream, private val output:OutputStream,
     /** 20015: 车机已停止 ACK。置位后 [sendRawAsync] / [postNow] 直接拒绝新帧，
      *  链路保持打开（不 close、不置 error），避免向停摆车机继续输出把它逼到复位。 */
     @Volatile private var peerSilent=false
+    /** 20015: 每判定一次「静默」就 +1（由 ackLock 串行化、volatile 供 worker 读）。
+     *  sendOptional 会把多帧一次性投进单线程 asyncSender：第一帧判定静默时，其余帧
+     *  早已排好队。若此时车机又发来一帧让 [peerSilent] 复位，那些旧任务仍会跑起来
+     *  继续向车机输出。用世代计数把它们与「静默后新提交的帧」区分开，旧任务直接丢弃。 */
+    @Volatile private var silentEpoch=0
     /** Last cumulative ACK accepted for the current generation. It is initialized to the
      *  pre-data send sequence so an ACK for the first slot advances from a known baseline. */
     private var receivedAck=-1
@@ -963,10 +968,17 @@ class IapLink(input:InputStream, private val output:OutputStream,
         // 20015: 车机已停摆时不再向它排队新帧（链路保持打开，等待上层退避）。
         if(closed.get()||error!=null||peerSilent)return false
         val copy=csm.copyOf()
+        // 20015: 记住提交时的静默世代；若排队期间发生静默，这个任务属于「静默前旧帧」，
+        // 即使车机随后又出声让 peerSilent 复位，也不能再把它写出去。
+        val submittedSilentEpoch=silentEpoch
         return try {
             asyncSender.execute {
                 var failureCause:Throwable?=null
-                try { sendCsm(copy,expectedGeneration) }
+                try {
+                    if(silentEpoch!=submittedSilentEpoch){
+                        log("iAP TX dropped (queued before silent epoch, 20015)")
+                    }else sendCsm(copy,expectedGeneration)
+                }
                 catch(t:Throwable){ failureCause=t }
                 finally { runCatching{completion(failureCause)} }
             }
@@ -1077,7 +1089,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
                     if(lastAckProgressNanos!=0L&&txSlots.isNotEmpty()){
                         val silentMs=(now-lastAckProgressNanos)/1_000_000L
                         if(silentMs>=SILENT_ABORT_MS){
-                            peerSilent=true
+                            peerSilent=true;silentEpoch++
                             txSlots.clear();pendingSeq=-1;ackPending=false;lastAckProgressNanos=0L
                             log("iAP peer silent "+silentMs+"ms; dropping queued TX, keeping link open (20015)")
                             throw PeerSilentException(silentMs)
@@ -1093,7 +1105,7 @@ class IapLink(input:InputStream, private val output:OutputStream,
                             // error+close+failure 把链路判死（这正是车机闪退/90 秒重建的触发点）。
                             val silentMs=if(lastAckProgressNanos==0L)0L
                                 else (now-lastAckProgressNanos)/1_000_000L
-                            peerSilent=true
+                            peerSilent=true;silentEpoch++
                             txSlots.clear();pendingSeq=-1;ackPending=false;lastAckProgressNanos=0L
                             log("iAP ACK retries exhausted seq="+slot.seq+" after "+silentMs+
                                 "ms; treating as silent peer, link stays open (20015)")
