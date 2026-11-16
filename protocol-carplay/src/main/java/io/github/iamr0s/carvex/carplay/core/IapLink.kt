@@ -125,6 +125,13 @@ class IapLink(input:InputStream, private val output:OutputStream,
     private data class TxSlot(val seq:Int,val payload:ByteArray,var attempts:Int=0,
                               var sentAtNanos:Long=0L,var retransmitRequested:Boolean=false)
     private val txSlots=java.util.LinkedHashMap<Int,TxSlot>()
+    /** 20015: 最近一次「收到 ACK 并推进」的时刻；0 表示当前没有进行中的发送。
+     *  衡量的是「车机多久没理我们」，不是「某一帧重传了多久」——后者每次重传都会刷新，
+     *  永远看不出对端已经停摆。由 ackLock 保护。 */
+    private var lastAckProgressNanos=0L
+    /** 20015: 车机已停止 ACK。置位后 [sendRawAsync] / [postNow] 直接拒绝新帧，
+     *  链路保持打开（不 close、不置 error），避免向停摆车机继续输出把它逼到复位。 */
+    @Volatile private var peerSilent=false
     /** Last cumulative ACK accepted for the current generation. It is initialized to the
      *  pre-data send sequence so an ACK for the first slot advances from a known baseline. */
     private var receivedAck=-1
@@ -284,6 +291,8 @@ class IapLink(input:InputStream, private val output:OutputStream,
             receivedAck=-1
             sentAck=0
             txSlots.clear()
+            lastAckProgressNanos=0L
+            peerSilent=false
             ackLock.notifyAll()
         }
         partial.reset();outOfOrder.clear();incoming.clear()
@@ -734,6 +743,15 @@ class IapLink(input:InputStream, private val output:OutputStream,
     private fun receive(f:IapWire.Frame) {
         log("iAP frame RX "+frameLine(f))
         if(f.flags==0x10){handleBareRst(f);return}
+        // 20015: 车机主动发来有效帧 = iAP 栈仍在工作，解除静默门控，让它松口后的
+        // 应答/交接能正常发出。纯 RST 已在上方排除。这里只做 volatile 写，不取 ackLock：
+        // postNow 的锁顺序是 writeLock -> ackLock（嵌套），读线程若在 ackLock 内再等
+        // writeLock 会与之形成环。lastAckProgressNanos 由下一次 acceptCumulativeAck 或
+        // sendCsm 的「无在飞帧」分支复位，无需在此触碰。
+        if((f.payload.isNotEmpty()||f.flags and 0x40!=0)&&peerSilent){
+            peerSilent=false
+            log("iAP peer active again; silent TX guard released (20015)")
+        }
         require(f.flags and 0x08==0){"UNSUPPORTED_LINK_CONTROL: SLP"}
         if(f.flags and 0x20!=0){
             // 24A446 EAK is 0x60 (ACK+EAK), session 0. Its body lists PSNs
@@ -870,6 +888,9 @@ class IapLink(input:InputStream, private val output:OutputStream,
         if(peerWindow>0&&((last-ack) and 255)>peerWindow)return
         receivedAck=ack
         acknowledged=ack
+        // 20015: 车机重新出声 => 静默计时归零、放开发送门控。
+        lastAckProgressNanos=System.nanoTime()
+        peerSilent=false
         val done=txSlots.values.filter{((ack-it.seq) and 255)<128}.map{it.seq}
         done.forEach{txSlots.remove(it)}
         pendingSeq=txSlots.keys.firstOrNull()?:-1
@@ -939,7 +960,8 @@ class IapLink(input:InputStream, private val output:OutputStream,
     /** Async form for already-framed CSM bytes. */
     fun sendRawAsync(csm:ByteArray,expectedGeneration:Int?=null,
                      completion:(Throwable?)->Unit = {}):Boolean {
-        if(closed.get()||error!=null)return false
+        // 20015: 车机已停摆时不再向它排队新帧（链路保持打开，等待上层退避）。
+        if(closed.get()||error!=null||peerSilent)return false
         val copy=csm.copyOf()
         return try {
             asyncSender.execute {
@@ -953,23 +975,20 @@ class IapLink(input:InputStream, private val output:OutputStream,
     }
 
     /**
-     * MyLink 20013: 立刻写一帧控制消息，不等它的 ACK，也不走有序 worker。
+     * 立刻写一帧控制消息，不等它的 ACK，也不走有序 worker（通用工具方法）。
      *
-     * 死锁背景：认证后主循环用 [sendAsync] 把 4e0e 等帧投给单线程 `asyncSender`，
-     * 其 worker 进入 @Synchronized 的 [sendCsm] 后在 `ackLock.wait()` 里等 ACK；
-     * 此时它一直占着 `this` 监视器和唯一的 worker。车机发 AE00 后要等 AE01 才
-     * ACK 4e0e，于是主循环即便 poll 到 AE00，若再用 [sendAsync] 回 AE01 也只会
-     * 排在卡死的 worker 后面，直到 4e0e 超时拆链都发不出去。
-     *
-     * 这里复用 [sendCsm] 相同的锁顺序（writeLock 快照 -> ackLock 分配 PSN 并登记
+     * 复用 [sendCsm] 相同的锁顺序（writeLock 快照 -> ackLock 分配 PSN 并登记
      * txSlot -> writeLock 写帧），但**不加 @Synchronized**、不进 ACK 等待循环，
      * 因此不与被卡死的 worker 争 `this` 监视器。登记 txSlot 让后续累积 ACK /
-     * 重传记账保持一致：车机对 AE01 的累积 ACK 会一并释放 4e0e 的 slot，
-     * [sendCsm] 随即被 [acceptCumulativeAck] 唤醒并正常退出。
+     * 重传记账保持一致。
+     *
+     * 20015: 20014 曾用它在 AE00 后强发 AE01（未定义消息），该分支已删除；
+     * 现保留为链路层工具，不再有业务调用方，且同样受 [peerSilent] 门控。
      */
     fun postNow(id:Int, fields:List<Pair<Int,ByteArray>> = emptyList(),
                 expectedGeneration:Int?=null):Boolean {
-        if(closed.get()||error!=null)return false
+        // 20015: 车机已停摆时不再写新帧（链路保持打开）。
+        if(closed.get()||error!=null||peerSilent)return false
         val snapshot=synchronized(writeLock){
             check(expectedGeneration==null||expectedGeneration==generation){
                 "iAP control generation changed before postNow"}
@@ -1010,6 +1029,10 @@ class IapLink(input:InputStream, private val output:OutputStream,
         return true
     }
     @Synchronized private fun sendCsm(data:ByteArray,expectedGeneration:Int?=null) {
+        // 20015: 静默判定前已经排进单线程 worker 的后续帧（4e0d/4e0c/5702/4300）在这里
+        // 统一丢弃。它们是在 peerSilent 置位前提交的，sendRawAsync 的入口门控拦不到；
+        // 若不拦，worker 逐个跑完仍会向已停摆的车机连写数帧，正是要避免的加压。
+        if(peerSilent){log("iAP TX dropped (queued before silent guard, 20015)");return}
         val snapshot=synchronized(writeLock){
             check(expectedGeneration==null||expectedGeneration==generation){"iAP control generation changed before send"}
             val session=checkNotNull(negotiatedControlSession){"iAP link has no confirmed control session"}
@@ -1038,9 +1061,27 @@ class IapLink(input:InputStream, private val output:OutputStream,
                     }
                 }else{
                     val capacity=peerWindow.coerceAtLeast(1)
+                    // 20015: 本轮发送的起点。没有在飞帧时把静默计时归到此刻——它衡量
+                    // 「车机多久没推进 ACK」，而不是「某一帧重传了多久」（后者每次重传都刷新，
+                    // 永远看不出对端已经停摆）。
+                    if(txSlots.isEmpty())lastAckProgressNanos=now
                     while(nextChunk<chunks.size&&txSlots.size<capacity){
                         sendSeq=(sendSeq+1) and 255
                         txSlots[sendSeq]=TxSlot(sendSeq,chunks[nextChunk++])
+                    }
+                    // 20015: 秒级不 ACK = 车机 iAP 栈已不处理输入，不是丢包。停止向它重传：
+                    // 真车（MingTu01 2026-11-05 22:07 / 22:12）重传 9 次 / 连发 6 帧后直接
+                    // Connection reset、黑屏、断电重启。这里只放弃这一帧并保留整条链路，
+                    // 不置 error、不 close、不 failure —— 关链路会触发车机 launcher stopCast /
+                    // CarWith releaseCastCore，重建要 90 秒。
+                    if(lastAckProgressNanos!=0L&&txSlots.isNotEmpty()){
+                        val silentMs=(now-lastAckProgressNanos)/1_000_000L
+                        if(silentMs>=SILENT_ABORT_MS){
+                            peerSilent=true
+                            txSlots.clear();pendingSeq=-1;ackPending=false;lastAckProgressNanos=0L
+                            log("iAP peer silent "+silentMs+"ms; dropping queued TX, keeping link open (20015)")
+                            throw PeerSilentException(silentMs)
+                        }
                     }
                     val retryLimit=retryCount+1
                     for(slot in txSlots.values.toList()){
@@ -1048,8 +1089,15 @@ class IapLink(input:InputStream, private val output:OutputStream,
                             (now-slot.sentAtNanos)>=retryMs*1_000_000L
                         if(!due)continue
                         if(slot.attempts>=retryLimit){
-                            val timeout=java.net.SocketTimeoutException("iAP ACK timeout seq="+slot.seq)
-                            error=timeout;negotiatedControlSession=null;close();failure(timeout);throw timeout
+                            // 20015: 单帧重传耗尽同样只是「对端沉默」，绝不能像旧版那样
+                            // error+close+failure 把链路判死（这正是车机闪退/90 秒重建的触发点）。
+                            val silentMs=if(lastAckProgressNanos==0L)0L
+                                else (now-lastAckProgressNanos)/1_000_000L
+                            peerSilent=true
+                            txSlots.clear();pendingSeq=-1;ackPending=false;lastAckProgressNanos=0L
+                            log("iAP ACK retries exhausted seq="+slot.seq+" after "+silentMs+
+                                "ms; treating as silent peer, link stays open (20015)")
+                            throw PeerSilentException(silentMs)
                         }
                         slot.attempts++
                         slot.sentAtNanos=now
@@ -1113,8 +1161,26 @@ class IapLink(input:InputStream, private val output:OutputStream,
             negotiatedControlSession=null;negotiatedSynchronizationSchema=null
         }
         frames.close();runCatching{input.close()};runCatching{output.close()}
-        synchronized(ackLock){ackTask?.cancel(false);ackTask=null;ackPending=false;txSlots.clear();pendingSeq=-1;ackLock.notifyAll()}
+        synchronized(ackLock){ackTask?.cancel(false);ackTask=null;ackPending=false;txSlots.clear();pendingSeq=-1;
+            lastAckProgressNanos=0L;peerSilent=false;ackLock.notifyAll()}
         reader?.interrupt();asyncSender.shutdownNow();ackScheduler.shutdownNow();handshakeDeadline.shutdownNow()
     }
 }
 private class SocketTimeoutExceptionCompat(s:String):java.net.SocketTimeoutException(s)
+
+/** 20015: 车机还在线、只是不再 ACK 我们的发送。
+ *
+ *  **这不是链路终结**：`IapLink` 保留链路与同步状态，只放弃这一帧；继承
+ *  [java.net.SocketTimeoutException] 让上层既有「对端不吭声」判定继续成立，同时
+ *  能区分「该等它松口」与「该收场」。
+ *
+ *  真车（MingTu01 2026-11-05 22:47）教训：把它当致命错误 `close()` 后，车机 launcher
+ *  立刻 `stopCast`、CarWith `releaseCastCore` 拆接收端，重建 90 秒。 */
+class PeerSilentException(val silentMs:Long):java.net.SocketTimeoutException(
+    "iAP peer stopped acknowledging "+silentMs+"ms ago while sending")
+
+/** 20015: 发送过程中「车机多久没推进 ACK 就停手」。健康车机 20~50ms，整份真车日志无例外；
+ *  一旦上到秒级就不是慢，而是它的 iAP 栈不处理输入了。取 3 秒（MingTu01 已实车验证）：
+ *  留出一次抖动余量，又不至于像旧规则那样重传 9~12 次把车机逼到
+ *  `Connection reset by peer` / 黑屏 / 断电重启。 */
+private const val SILENT_ABORT_MS=3_000L

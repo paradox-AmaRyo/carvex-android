@@ -110,6 +110,11 @@ object Bootstrap {
     private const val HANDSHAKE_DEADLINE_MS=90_000L
     /** After the Wi-Fi configuration arrives, how long a still-missing 0x5703 announcement is awaited. */
     private const val ANNOUNCEMENT_WAIT_MS=30_000L
+    /** 20015: 车机停止 ACK 后，在原 handoff deadline 之上额外追加的「等它松口」预算。
+     *  真车（MingTu01 2026-11-05 22:47）在链路被 close 后要 90 秒才释放上一段会话；
+     *  `handoffWaitMs` 默认 30 秒太早 throw 收摊，再追加 25 秒（合计 55 秒，仍短于
+     *  [HANDSHAKE_DEADLINE_MS] 的 90 秒整体兜底），把时间花在等车机自己恢复而不是重建。 */
+    private const val PEER_SILENT_BUDGET_MS=25_000L
     /** A fresh SYN invalidates all Identification/AA state. Re-run the bootstrap a small number of
      * times on the new link generation instead of continuing with stale credentials. */
     private const val MAX_BOOTSTRAP_LINK_RESTARTS=2
@@ -372,6 +377,10 @@ object Bootstrap {
         var announcementDeadline=0L
         var handoffDeadline=0L
         var startWaitLogged=false
+        var silentWaitLogged=false
+        // 20015: sendAsync 的 completion 在 iap2-tx worker 线程回调，主循环在主线程读它。
+        // 第一次 PeerSilentException 的时刻即「车机停摆」的起点；用原子量跨线程传。
+        val peerSilentSince=java.util.concurrent.atomic.AtomicLong(0L)
         var certificateTransaction:IapAuthentication.CertificateTransaction?=null
         var cert:java.security.cert.X509Certificate?=null
         var authenticationSchema:AccessoryAuth.ChallengeSchema?=null
@@ -411,8 +420,8 @@ object Bootstrap {
          *  固件里 0x1D03/0xAA04 没有入站处理器；本实现把它们当终止通知，放行以保留快速失败。 */
         val unconditionalInbound=setOf(0x0000,0x0004,0x0005,0x1d01,0x1d03,0x1d05,0x1d06,
             0xaa01,0xaa03,0xaa04,
-            // AE00 是车机在识别完成后主动发起的 Power 组请求，不会出现在 accessorySends 里。
-            // 放行它，否则被 inboundAllowed 挡掉后永远回不了 AE01。
+            // AE00 是车机在识别完成后主动发起的 Power 组会话起点，不会出现在 accessorySends 里。
+            // 20015：放行仅为记录其字段用于诊断；不回任何应答（AE01 不是协议定义的消息）。
             0xae00)
         fun inboundAllowed(id:Int):Boolean{
             if(id in unconditionalInbound)return true
@@ -426,16 +435,20 @@ object Bootstrap {
             optionalSent=true
             handoffDeadline=System.nanoTime()+handoffWaitMs*1_000_000L
             // MyLink 20013: 认证后的这些帧都是通知类可选项，必须用「入队即返回」的
-            // 固件语义。同步 send() 会阻塞等链路 ACK；车机在 AE00 之后正等 AE01，
-            // 不会 ACK 4e0e，主循环卡在这里就 poll 不到已经到达的 AE00，AE01 一次
-            // 都发不出去，最终车机超时拆 RFCOMM。改用 IapLink.sendAsync 让主循环
-            // 立即回到 link.poll() 处理 AE00。
+            // 固件语义。同步 send() 会阻塞等链路 ACK，主循环卡在这里就 poll 不到
+            // 已经到达的入站消息。改用 IapLink.sendAsync 让主循环立即回到 link.poll()。
+            // 20015: 不再假设「车机等 AE01 才 ACK 4e0e」——AE01 是未定义消息，已删除。
             fun queue(id:Int,fields:List<Pair<Int,ByteArray>> = emptyList()){
                 checkGeneration()
                 log(ProtocolTrace.event("IAP2","RFCOMM","tx","0x"+id.toString(16),"queued","fields"+fields.size))
-                link.sendAsync(id,fields,expectedGeneration=generation){t->
-                    if(t!=null)log("async tx 0x"+id.toString(16)+" failed: "+t.javaClass.simpleName+" "+(t.message?:""))
+                val queued=link.sendAsync(id,fields,expectedGeneration=generation){t->
+                    if(t==null)return@sendAsync
+                    log("async tx 0x"+id.toString(16)+" failed: "+t.javaClass.simpleName+" "+(t.message?:""))
+                    // 20015: 链路层判定「车机停摆」时不收摊；记录起点让主循环等待它松口。
+                    if(generateSequence<Throwable>(t){it.cause}.any{it is PeerSilentException})
+                        peerSilentSince.compareAndSet(0L,System.nanoTime())
                 }
+                if(!queued)log("async tx 0x"+id.toString(16)+" not queued (link closed or silent guard, 20015)")
             }
             // 4e0e 参数 0 是蓝牙 MAC，参数 1 是设备唯一标识（C-0024 的 copyUniqueDeviceID 一解，
             // 与 4e0c 同源）。标识为空时只发参数 0，并在日志里说明少发了哪一个。
@@ -451,24 +464,30 @@ object Bootstrap {
             messages.forEach{(id,fields)->if(id in received)queue(id,fields)else log("Skip unadvertised "+id.toString(16))}
             if(identity.id.isNotEmpty())queue(0x4e0c,listOf(0 to IapWire.cstring(identity.id)))
             else log("Skip 4e0c: empty device UUID")
-            // 24A446 advertises what it can receive; if the head unit promised
-            // 0x5702/0x4300 in Identify, send them regardless of the locally
-            // parsed route flags, which are derived from a narrower byte range.
-            if(received.contains(0x5702))queue(0x5702)
-            if(received.contains(0x4300))queue(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
+            // 20015: 每条「开始新会话」请求整个 session 只发一次。24A446 固件
+            // (_iap2_wifisharing_RequestAccessoryWiFiConfigurationInformation @0x100170bb0)
+            // 在 feature 22 启动时只调一次 send，没有 retry / timer / backward branch。
+            // 旧代码按 received 发一遍、下面又按 routes 发一遍，等于同一帧连发两次；
+            // 真车证据（MingTu01 2026-11-05 22:07 / 22:12）表明重复敲 5702 会把停摆的
+            // 车机逼到 Connection reset / 黑屏 / 断电重启。
+            val startSessionFields=listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac))))
+            val wifiAnnouncementRequested=received.contains(0x5702)
+            val carPlayStartRequested=received.contains(0x4300)
+            if(wifiAnnouncementRequested){
+                queue(0x5702);announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
+            }
+            if(carPlayStartRequested)queue(0x4300,startSessionFields)
             if(runtimeSession)return
             // 24A446 creates a declaration pair only when both directions are
             // present: phone->accessory request and accessory->phone response.
-            // Sending one half on a one-sided declaration leaves the bootstrap
-            // waiting for a message the peer never promised to send.
+            // 声明里没覆盖到、但本地路由标志支持的，补发一次（仍保证每帧最多一次）。
             val routes=requireNotNull(identified).capabilities.networkHandoff
-            if(routes.wifiAnnouncement){
+            if(routes.wifiAnnouncement&&!wifiAnnouncementRequested){
                 queue(0x5702);announcementDeadline=System.nanoTime()+ANNOUNCEMENT_WAIT_MS*1_000_000
             }
-            if(routes.carPlayStartSession){
-                queue(0x4300,listOf(1 to IapWire.fields(listOf(0 to byteArrayOf(1),1 to IapWire.cstring(phoneMac)))))
-            }
-            if(!routes.hasSupportedRoute)log("Identification accepted; no locally supported network handoff route declared")
+            if(routes.carPlayStartSession&&!carPlayStartRequested)queue(0x4300,startSessionFields)
+            if(!routes.hasSupportedRoute&&!wifiAnnouncementRequested&&!carPlayStartRequested)
+                log("Identification accepted; no locally supported network handoff route declared")
         }
         var evidence=PeerEvidence(version=PeerVersion(controlSession=control.version))
         var profile:IapPeerProfile=IapPeerProfiles.select(evidence)
@@ -478,6 +497,20 @@ object Bootstrap {
         try{
             while(true){
                 checkGeneration();checkDeadlines()
+                // 20015: 链路层报「车机停摆」后，不再在原 handoffDeadline（默认 30s）
+                // 到点时主动 throw 收摊（throw 会一路 close RFCOMM，触发车机 stopCast /
+                // 重建 90 秒）。在原预算之上追加 25s，期间主循环照常 poll，等它自己松口。
+                // 注意：不能写成 max(handoffDeadline, silentSince+25s)——sendOptional 起算的
+                // 30s 本来就比 silentSince+25s 更晚，那样等于没有延展。
+                val silentSince=peerSilentSince.get()
+                val effectiveHandoffDeadline=if(silentSince!=0L)
+                    handoffDeadline+PEER_SILENT_BUDGET_MS*1_000_000L
+                    else handoffDeadline
+                if(silentSince!=0L&&!silentWaitLogged){
+                    silentWaitLogged=true
+                    log("the car stopped acknowledging; staying connected for up to "+
+                        (PEER_SILENT_BUDGET_MS/1000)+"s instead of tearing the session down (20015)")
+                }
                 // Link ACK, early Wi-Fi config or remote AA/05 do not prove local authentication.
                 if(transactions.ready){
                     sendOptional()
@@ -502,8 +535,8 @@ object Bootstrap {
                         // platform observation, not automatically usable credentials.
                         // Keep the existing local budget; another message does not renew it.
                         val networkOnlyError=runCatching{currentAnnouncement.requireNetworkOnly()}.exceptionOrNull()
-                        if(networkOnlyError!=null&&now>=handoffDeadline)throw networkOnlyError
-                        if(networkOnlyError==null&&(!startRequested||now>=handoffDeadline)){
+                        if(networkOnlyError!=null&&now>=effectiveHandoffDeadline)throw networkOnlyError
+                        if(networkOnlyError==null&&(!startRequested||now>=effectiveHandoffDeadline)){
                             if(startRequested)log("Requested 4301 deadline reached; evaluating 5703-only discovery")
                             break
                         }
@@ -514,14 +547,14 @@ object Bootstrap {
                         }
                     }
                     // No 57/02 is not evidence of USB: a peer can answer 43/00 directly.
-                    if(startConfig==null&&now>=handoffDeadline)
+                    if(startConfig==null&&now>=effectiveHandoffDeadline)
                         throw TransportException(if(0x4300 in received||0x5702 in received)
                             TransportErrorCategory.HANDOFF_FAILED else TransportErrorCategory.PLATFORM_UNSUPPORTED,
                             "No wireless handoff negotiated; USB Phone gadget/OTG and network platform service may be required")
                 }
                 val state=transactions.context(LinkTransport.BT_RFCOMM,ConnectionDirection.OUTBOUND)
                 val activeDeadlines=mutableListOf(deadline)
-                if(transactions.ready&&startConfig==null&&handoffDeadline!=0L)activeDeadlines+=handoffDeadline
+                if(transactions.ready&&startConfig==null&&handoffDeadline!=0L)activeDeadlines+=effectiveHandoffDeadline
                 if(authDeadline!=0L&&!transactions.authenticationComplete)activeDeadlines+=authDeadline
                 if(identificationDeadline!=0L&&state.identificationState!=IdentificationState.ACCEPTED)activeDeadlines+=identificationDeadline
                 val command=link.poll(((activeDeadlines.min()-System.nanoTime())/1_000_000).coerceIn(1,500))?:continue
@@ -684,20 +717,20 @@ object Bootstrap {
                         val request=requireNotNull(certificateTransaction).onSerial(fields,generation,linkEpoch)
                         send(0xaa00,request)
                     }
-                    // Power 组 AE00：车机请求启动外接配件会话（StartExternalAccessorySession）。
-                    // 24A446 规则表把 AE00/AE01 列为 required 对，只有 AE00 没有 AE01 时车机会
-                    // 认为会话没建立。实测 MyLink 在发出 AE00 后约 1.2s 主动拆掉 RFCOMM，
-                    // 而此前 4e0e 恰好卡在这个时间窗内。应答载荷格式研究文档仍标 OPEN，
-                    // 这里先回一个空参数应答，把链路保活，观察车机后续行为。
+                    // Power 组 AE00：车机在识别完成后主动发起的会话起点，仅记录、不回应。
+                    // 20015 更正：研究档 12-message-table.md:144-154 的 Power 表只有
+                    // AE00/AE02/AE03/AE05/AE06，AE01 不是协议定义消息；20014 回空参数 AE01 后
+                    // 车机连链路层 ACK 都停了，随后 4e0e/AE01 重传并复位 CarPlay 插件。
+                    // 固件 24A446 也没有 AE01 handler。这里把字段打进 diagnostics，
+                    // 供三次实车对照；绝不伪造未定义应答。
                     0xae00->{
-                        // 必须走 postNow：此刻 asyncSender 的唯一 worker 多半还卡在 4e0e
-                        // 的 ACK 等待里（车机在等 AE01 才 ACK），sendAsync 会排队到拆链
-                        // 都发不出去。postNow 直接写一帧并立刻返回，不等 ACK。
-                        checkGeneration()
-                        log(ProtocolTrace.event("IAP2","RFCOMM","tx","0xae01","queued","fields0"))
-                        val posted=link.postNow(0xae01,expectedGeneration=generation)
-                        log(if(posted)"AE01 posted in reply to AE00 (StartExternalAccessorySession); payload format still OPEN"
-                            else "AE01 postNow failed (link closed or generation changed)")
+                        val dump=fields.ordered.joinToString(prefix="[",postfix="]"){(id,value)->
+                            val hex=value.joinToString(""){java.lang.String.format(java.util.Locale.ROOT,"%02X",it.toInt() and 255)}
+                            val text=runCatching{IapWire.text(value)}.getOrDefault("")
+                            java.lang.String.format(java.util.Locale.ROOT,"0x%04X",id)+"="+hex+
+                                (if(text.isEmpty())"" else "(\""+text+"\")")
+                        }
+                        log("AE00 received, fields="+dump+"; no AE01 reply (undefined message, 20015)")
                     }
                     0xaa04->throw SecurityException("Accessory authentication rejected")
                     // A peer 1D03 remains a local terminal policy; it is not the
